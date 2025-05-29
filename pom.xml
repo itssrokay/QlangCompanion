@@ -52,6 +52,13 @@
             <version>0.26.2</version>
         </dependency>
 
+        <!-- OkHttp3 for DAPI calls with SSL bypass -->
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp</artifactId>
+            <version>4.12.0</version>
+        </dependency>
+
         <dependency>
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-junit5</artifactId>

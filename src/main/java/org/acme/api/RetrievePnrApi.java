@@ -4,15 +4,54 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.ws.rs.client.Client;
-import jakarta.ws.rs.client.ClientBuilder;
-import jakarta.ws.rs.core.MediaType;
-import jakarta.ws.rs.core.Response;
+import jakarta.inject.Inject;
+
+import org.eclipse.microprofile.config.Config;
+
+import okhttp3.*;
+import javax.net.ssl.*;
+import java.security.cert.X509Certificate;
+import java.util.concurrent.TimeUnit;
 
 @ApplicationScoped
 public class RetrievePnrApi {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Inject
+    Config config;
+
+    // Create insecure OkHttpClient
+    private static final OkHttpClient INSECURE_CLIENT = createInsecureClient();
+
+    private static OkHttpClient createInsecureClient() {
+        try {
+            // Trust all certificates
+            TrustManager[] trustAllCerts = new TrustManager[]{
+                    new X509TrustManager() {
+                        public void checkClientTrusted(X509Certificate[] chain, String authType) {}
+                        public void checkServerTrusted(X509Certificate[] chain, String authType) {}
+                        public X509Certificate[] getAcceptedIssuers() {
+                            return new X509Certificate[0];
+                        }
+                    }
+            };
+
+            SSLContext sslContext = SSLContext.getInstance("SSL");
+            sslContext.init(null, trustAllCerts, new java.security.SecureRandom());
+
+            return new OkHttpClient.Builder()
+                    .sslSocketFactory(sslContext.getSocketFactory(), (X509TrustManager) trustAllCerts[0])
+                    .hostnameVerifier((hostname, session) -> true) // Disable hostname check
+                    .connectTimeout(20, TimeUnit.SECONDS)
+                    .readTimeout(30, TimeUnit.SECONDS)
+                    .build();
+
+        } catch (Exception e) {
+            System.out.println("Failed to create insecure client: " + e.getMessage());
+            throw new RuntimeException("Failed to create insecure client", e);
+        }
+    }
 
     public String retrievePnrDapi(String payload) {
         System.out.println("=== RETRIEVE_PNR API HANDLER CALLED ===");
@@ -30,138 +69,177 @@ public class RetrievePnrApi {
             System.out.println("  - pnr: " + pnr);
             System.out.println("  - lastName: " + lastName);
             
-            // Check if real DAPI configuration is available at runtime
+            // Get DAPI configuration
             String dapiEndpoint = getDapiEndpoint();
             String dapiAuthToken = getDapiAuthToken();
             
-            if (dapiEndpoint != null && !dapiEndpoint.isEmpty() && 
-                dapiAuthToken != null && !dapiAuthToken.isEmpty()) {
-                
-                System.out.println("Using REAL DAPI API");
-                return callRealDapiApi(pnr, lastName, dapiEndpoint, dapiAuthToken);
-                
-            } else {
-                System.out.println("DAPI configuration not available, using MOCK data");
-                return getMockResponse(pnr, lastName);
+            System.out.println("Configuration Check:");
+            System.out.println("  - DAPI Endpoint: " + (dapiEndpoint != null && !dapiEndpoint.isEmpty() ? dapiEndpoint : "NOT SET"));
+            System.out.println("  - DAPI Token: " + (dapiAuthToken != null && !dapiAuthToken.isEmpty() ? "***SET***" : "NOT SET"));
+            
+            // Validate required configuration
+            if (dapiEndpoint == null || dapiEndpoint.isEmpty()) {
+                String errorResponse = """
+                    {
+                        "status": "error",
+                        "message": "DAPI endpoint not configured. Please set dapi.endpoint in application.properties or DAPI_ENDPOINT environment variable."
+                    }
+                    """;
+                System.out.println("ERROR: DAPI endpoint not configured");
+                System.out.println("=== END RETRIEVE_PNR API HANDLER (CONFIG ERROR) ===");
+                return errorResponse;
             }
+            
+            if (dapiAuthToken == null || dapiAuthToken.isEmpty()) {
+                String errorResponse = """
+                    {
+                        "status": "error",
+                        "message": "DAPI auth token not configured. Please set dapi.auth.token in application.properties or DAPI_1AAUTH_TOKEN_AC environment variable."
+                    }
+                    """;
+                System.out.println("ERROR: DAPI auth token not configured");
+                System.out.println("=== END RETRIEVE_PNR API HANDLER (CONFIG ERROR) ===");
+                return errorResponse;
+            }
+            
+            // Call real DAPI API using OkHttp3
+            System.out.println("Calling REAL DAPI API with OkHttp3");
+            return callRealDapiApi(pnr, lastName, dapiEndpoint, dapiAuthToken);
             
         } catch (Exception e) {
             System.out.println("Error processing request: " + e.getMessage());
             e.printStackTrace();
             
-            // Fall back to mock data on any error
-            System.out.println("Falling back to mock data due to error");
-            return getMockResponse("ERROR", "ERROR");
+            String errorResponse = String.format("""
+                {
+                    "status": "error",
+                    "message": "Failed to process PNR request",
+                    "error": "%s"
+                }
+                """, e.getMessage().replace("\"", "\\\""));
+            
+            System.out.println("=== END RETRIEVE_PNR API HANDLER (ERROR) ===");
+            return errorResponse;
         }
     }
     
     private String getDapiEndpoint() {
-        // Try environment variable first, then system property
+        // Try environment variable first
         String endpoint = System.getenv("DAPI_ENDPOINT");
-        if (endpoint == null || endpoint.isEmpty()) {
-            endpoint = System.getProperty("dapi.endpoint", "");
+        if (endpoint != null && !endpoint.isEmpty()) {
+            return endpoint;
         }
-        return endpoint;
+        
+        // Try application.properties via Quarkus Config
+        try {
+            return config.getOptionalValue("dapi.endpoint", String.class).orElse("");
+        } catch (Exception e) {
+            System.out.println("Error reading dapi.endpoint config: " + e.getMessage());
+            return "";
+        }
     }
     
     private String getDapiAuthToken() {
-        // Try environment variable first, then system property
+        // Try environment variable first
         String token = System.getenv("DAPI_1AAUTH_TOKEN_AC");
-        if (token == null || token.isEmpty()) {
-            token = System.getProperty("dapi.auth.token", "");
+        if (token != null && !token.isEmpty()) {
+            return token;
         }
-        return token;
+        
+        // Try application.properties via Quarkus Config
+        try {
+            return config.getOptionalValue("dapi.auth.token", String.class).orElse("");
+        } catch (Exception e) {
+            System.out.println("Error reading dapi.auth.token config: " + e.getMessage());
+            return "";
+        }
     }
     
     private String getDapiPurchaseOrder() {
-        // Try environment variable first, then system property, then default
+        // Try environment variable first
         String purchaseOrder = System.getenv("DAPI_PURCHASE_ORDER");
-        if (purchaseOrder == null || purchaseOrder.isEmpty()) {
-            purchaseOrder = System.getProperty("dapi.purchase.order", "/orders/");
+        if (purchaseOrder != null && !purchaseOrder.isEmpty()) {
+            return purchaseOrder;
         }
-        return purchaseOrder;
+        
+        // Try application.properties via Quarkus Config, with default
+        try {
+            return config.getOptionalValue("dapi.purchase.order", String.class).orElse("/orders/");
+        } catch (Exception e) {
+            System.out.println("Error reading dapi.purchase.order config: " + e.getMessage());
+            return "/orders/";
+        }
     }
     
     private String callRealDapiApi(String pnr, String lastName, String dapiEndpoint, String dapiAuthToken) {
         // Build the API URL: {DAPI_ENDPOINT}{DAPI_PURCHASE_ORDER}{pnr}
         String dapiPurchaseOrder = getDapiPurchaseOrder();
-        String apiUrl = dapiEndpoint + dapiPurchaseOrder + pnr;
-        System.out.println("Making API call to: " + apiUrl);
+        String baseUrl = dapiEndpoint.endsWith("/") ? dapiEndpoint : dapiEndpoint + "/";
+        String purchaseOrderPath = dapiPurchaseOrder.startsWith("/") ? dapiPurchaseOrder.substring(1) : dapiPurchaseOrder;
+        String apiUrl = baseUrl + purchaseOrderPath + pnr + "?lastName=" + lastName;
         
-        // Create HTTP client
-        Client client = ClientBuilder.newClient();
+        System.out.println("Making OkHttp3 API call to: " + apiUrl);
+        System.out.println("With Authorization: 1AAuth " + dapiAuthToken.substring(0, Math.min(dapiAuthToken.length(), 10)) + "...");
         
         try {
-            // Make the API call with authentication
-            Response response = client.target(apiUrl)
-                .queryParam("lastName", lastName)
-                .request(MediaType.APPLICATION_JSON)
-                .header("Authorization", "1AAuth " + dapiAuthToken)
-                .get();
+            // Build the request
+            Request request = new Request.Builder()
+                    .url(apiUrl)
+                    .header("Authorization", "1AAuth " + dapiAuthToken)
+                    .header("Accept", "application/json")
+                    .get()
+                    .build();
             
-            System.out.println("Response Status Code: " + response.getStatus());
-            
-            if (response.getStatus() == 200) {
-                String responseBody = response.readEntity(String.class);
-                System.out.println("API Response Content:");
-                System.out.println(responseBody);
-                System.out.println("=== END RETRIEVE_PNR API HANDLER ===");
+            // Execute the request
+            try (Response response = INSECURE_CLIENT.newCall(request).execute()) {
+                System.out.println("Response Status Code: " + response.code());
                 
-                return responseBody;
-            } else {
-                String errorBody = response.readEntity(String.class);
-                System.out.println("API Error Response:");
-                System.out.println(errorBody);
-                
-                // Return error response in expected format
-                String errorResponse = String.format("""
-                    {
-                        "status": "error",
-                        "code": %d,
-                        "message": "API call failed",
-                        "details": %s
-                    }
-                    """, response.getStatus(), errorBody != null ? "\"" + errorBody.replace("\"", "\\\"") + "\"" : "null");
-                
-                return errorResponse;
-            }
-            
-        } finally {
-            client.close();
-        }
-    }
-    
-    private String getMockResponse(String pnr, String lastName) {
-        // Mock API response simulating real PNR data
-        String mockResponse = String.format("""
-            {
-                "status": "success",
-                "source": "mock",
-                "data": {
-                    "pnr": "%s",
-                    "passengerName": "John %s",
-                    "flightNumber": "AB1234",
-                    "departure": {
-                        "airport": "JFK",
-                        "city": "New York",
-                        "dateTime": "2024-03-25T10:00:00"
-                    },
-                    "arrival": {
-                        "airport": "LAX", 
-                        "city": "Los Angeles",
-                        "dateTime": "2024-03-25T13:00:00"
-                    },
-                    "seatNumber": "12A",
-                    "class": "Economy",
-                    "status": "Confirmed"
+                if (response.isSuccessful()) {
+                    String responseBody = response.body() != null ? response.body().string() : "";
+                    System.out.println("API Response Content:");
+                    System.out.println(responseBody);
+                    System.out.println("=== END RETRIEVE_PNR API HANDLER (SUCCESS) ===");
+                    
+                    return responseBody;
+                } else {
+                    String errorBody = response.body() != null ? response.body().string() : "";
+                    System.out.println("API Error Response:");
+                    System.out.println("Status: " + response.code());
+                    System.out.println("Body: " + errorBody);
+                    
+                    // Return error response in expected format
+                    String errorResponse = String.format("""
+                        {
+                            "status": "error",
+                            "code": %d,
+                            "message": "DAPI API call failed",
+                            "details": %s,
+                            "url": "%s"
+                        }
+                        """, response.code(), 
+                             errorBody != null && !errorBody.isEmpty() ? "\"" + errorBody.replace("\"", "\\\"") + "\"" : "null",
+                             apiUrl);
+                    
+                    System.out.println("=== END RETRIEVE_PNR API HANDLER (API ERROR) ===");
+                    return errorResponse;
                 }
             }
-            """, pnr, lastName);
-        
-        System.out.println("Mock API Response:");
-        System.out.println(mockResponse);
-        System.out.println("=== END RETRIEVE_PNR API HANDLER ===");
-        
-        return mockResponse;
+            
+        } catch (Exception e) {
+            System.out.println("Exception during API call: " + e.getMessage());
+            e.printStackTrace();
+            
+            String errorResponse = String.format("""
+                {
+                    "status": "error",
+                    "message": "Failed to connect to DAPI",
+                    "error": "%s",
+                    "url": "%s"
+                }
+                """, e.getMessage().replace("\"", "\\\""), apiUrl);
+            
+            System.out.println("=== END RETRIEVE_PNR API HANDLER (CONNECTION ERROR) ===");
+            return errorResponse;
+        }
     }
 } 
